@@ -1,10 +1,6 @@
 # Open Typeless Harness
 
 <p align="center">
-  <img src="docs/assets/open-typeless-harness-cover.png" alt="Open Typeless Harness cover" width="780">
-</p>
-
-<p align="center">
   <strong>Voice input that learns from the corrections you actually make.</strong>
 </p>
 
@@ -15,8 +11,8 @@
 <p align="center">
   <a href="README.zh.md">中文</a> •
   <a href="#why-it-exists">Why</a> •
-  <a href="#product-preview">Preview</a> •
-  <a href="#learning-loop">Learning Loop</a>
+  <a href="#how-it-learns-your-habits">Learning</a> •
+  <a href="#status">Status</a>
 </p>
 
 <p align="center">
@@ -26,6 +22,10 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-blue">
 </p>
 
+<p align="center">
+  <img src="docs/assets/open-typeless-harness-app.png" alt="Open Typeless Harness app screenshot" width="780">
+</p>
+
 ## Why It Exists
 
 Plain speech-to-text keeps making the same mistakes: product names, project names, mixed Chinese/English terms, and the phrases you always fix right after insertion.
@@ -33,24 +33,6 @@ Plain speech-to-text keeps making the same mistakes: product names, project name
 Open Typeless Harness treats those edits as signal. It transcribes, polishes, inserts into the focused field, then learns from your post-insertion corrections so future dictation better matches your vocabulary.
 
 > Every correction after the text lands should make the next insertion better.
-
-## Product Preview
-
-<p align="center">
-  <img src="docs/assets/open-typeless-harness-product.png" alt="Open Typeless Harness product preview" width="780">
-</p>
-
-<p align="center">
-  <img src="docs/assets/open-typeless-harness-demo.gif" alt="Open Typeless Harness focused-field insertion demo" width="780">
-</p>
-
-<p align="center">
-  <a href="docs/assets/open-typeless-harness-demo.mp4">Watch MP4 demo</a>
-</p>
-
-| Before insertion | After insertion |
-| --- | --- |
-| <img src="docs/assets/open-typeless-harness-real-before.png" alt="Before focused-field insertion" width="390"> | <img src="docs/assets/open-typeless-harness-real-after.png" alt="After focused-field insertion" width="390"> |
 
 ## What It Should Remember
 
@@ -62,20 +44,15 @@ Open Typeless Harness treats those edits as signal. It transcribes, polishes, in
 
 The goal is not just prettier transcription. The goal is a voice input layer that adapts to the words you actually use.
 
-## Learning Loop
+## How It Learns Your Habits
 
-<p align="center">
-  <img src="docs/assets/open-typeless-harness-learning-loop.png" alt="Open Typeless Harness learning loop" width="780">
-</p>
+1. You dictate into the app you are already using.
+2. The app inserts polished text into the focused field.
+3. For a short window after insertion, the edit monitor watches how that text changes.
+4. If the same correction pattern appears repeatedly, it becomes a local speech skill.
+5. On later dictation, matching speech skills are retrieved before polishing, so the model sees your vocabulary before it writes.
 
-```text
-Speak
-  -> ASR transcript
-  -> LLM polish with retrieved speech skills
-  -> Insert into the focused text field
-  -> Observe post-insertion edits
-  -> Save stable local speech skills
-```
+This is why the learning loop is based on edits after insertion, not just ASR confidence. Your actual correction is the strongest preference signal.
 
 ## Local By Default
 
