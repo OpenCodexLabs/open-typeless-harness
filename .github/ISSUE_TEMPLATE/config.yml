@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: OpenLess issue / PR 规范
+    url: https://github.com/appergb/openless
+    about: 提交前请确认中文正文、upstream 兼容标题、issue-first 和单一职责 PR 规则。

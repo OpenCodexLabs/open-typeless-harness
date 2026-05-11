@@ -1,0 +1,36 @@
+.DS_Store
+.build/
+build/
+.swiftpm/
+*.xcodeproj
+Package.resolved
+xcuserdata/
+DerivedData/
+ChatGPT Image*.jpg
+
+# Local config / secrets
+*.env
+config.local.json
+# Tauri updater 签名私钥（绝不上传 — 公钥在 tauri.conf.json，私钥放 GitHub Secret）
+*.key
+*.key.pub
+密钥对.zip
+密钥对/
+
+# Local working dirs that don't belong in the repo
+SC/
+apps/
+promo/
+promo-openless/
+docs/old-promo/
+.worktrees/
+
+# Windows TSF IME local build outputs
+openless-all/app/windows-ime/OpenLessIme/
+openless-all/app/windows-ime/x64/
+openless-all/app/windows-ime/Win32/
+openless-all/app/windows-ime/Release/
+openless-all/app/windows-ime/obj/
+
+# Planning docs are kept local only, not published to the public repo.
+docs/plans/

@@ -1,0 +1,62 @@
+name: 问题 / 缺陷
+description: 按 OpenLess 当前 issue 口径记录可复现或可审计的问题。
+title: "[area] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        所有人类可读内容必须使用中文。一个 issue 只描述一个可独立处理的问题。
+
+        标题硬约束：
+        - 使用中文短句，推荐格式：`[area] 现象或目标`
+        - `area` 使用仓库约定的范围名称，例如 `infra/devex`、`windows`、`macos`、`tauri`、`audio`、`asr`、`insertion`、`ui`
+        - 不使用 fork-only 状态前缀，例如 `status/ready`、`agent/*`、`scope/*`
+
+        Labels 硬约束：
+        - 必须恰好选择 1 个类型：`bug` / `enhancement` / `documentation`
+        - 如果仓库已配置优先级标签，必须恰好选择 1 个优先级：`critical` / `high` / `medium` / `low`
+        - 如果仓库已配置范围标签，必须至少选择 1 个范围：`area:*`
+        - 可选：`needs-split`
+        - 不要把 `status/*`、`kind/*`、`agent/*`、`scope/*` 用到 upstream 或 upstream-ready issue 上。
+  - type: textarea
+    id: symptom
+    attributes:
+      label: 现象
+      description: 描述当前可观察到的问题、触发条件和证据。必要时列出日志、截图、layout、commit 或 PR。
+      placeholder: |
+        ## 现象
+
+        - 触发条件：
+        - 当前表现：
+        - 证据：
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响
+      description: 说明对用户、开发、测试、视觉资产治理、构建或交付流程的影响。
+      placeholder: |
+        ## 影响
+
+        -
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 建议接受标准
+      description: 写成可验证的完成条件；不确定项写 TODO，不编造。
+      placeholder: |
+        ## 建议接受标准
+
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: todo
+    attributes:
+      label: TODO / 不确定项
+      description: 只写尚未确认但必须保留的问题，不要补不存在的事实。

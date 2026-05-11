@@ -1,0 +1,4 @@
+[target.x86_64-pc-windows-gnu]
+# MinGW's PE linker auto-exports Rust symbols from the desktop-only cdylib,
+# which overflows the export ordinal table during GNU builds/tests.
+rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

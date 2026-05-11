@@ -1,0 +1,774 @@
+//! Local persistence: history JSON, user preferences JSON, vocab JSON, and
+//! Keychain-backed credentials vault.
+//!
+//! Storage roots:
+//! - macOS:   `~/Library/Application Support/OpenTypelessHarness`
+//! - Windows: `%APPDATA%\OpenTypelessHarness`
+//! - Linux:   `$XDG_DATA_HOME/OpenTypelessHarness` or `~/.local/share/OpenTypelessHarness`
+//!
+//! Divergence from Swift: the Swift `CredentialsVault` falls back to a JSON
+//! file (`~/.openless/credentials.json`) when Keychain is unavailable. The
+//! Rust port intentionally does NOT replicate that fallback — we rely solely
+//! on the platform keyring. The macOS service name (`com.openless.app`) is
+//! preserved so existing Keychain entries from the Swift app remain readable.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::types::{DictationSession, DictionaryEntry, UserPreferences, VocabPresetStore};
+
+const HISTORY_CAP: usize = 200;
+const HISTORY_FILE: &str = "history.json";
+const PREFERENCES_FILE: &str = "preferences.json";
+/// 与 Swift `Sources/OpenLessPersistence/DictionaryStore.swift` 同名，
+/// 让旧版词汇表在升级后无缝继承。**不要**改成 `vocab.json`，会丢用户数据。
+const VOCAB_FILE: &str = "dictionary.json";
+const VOCAB_PRESETS_FILE: &str = "vocab-presets.json";
+
+/// Swift 老 `CredentialsVault` 的 JSON 备用路径。
+/// 升级到 Tauri 版后，先尝试 Keychain；Keychain 没有时回落读这个文件，
+/// 让用户在 Swift 版填过的凭据无需重输。
+const LEGACY_CREDS_DIR: &str = ".openless";
+const LEGACY_CREDS_FILE: &str = "credentials.json";
+
+static CREDENTIALS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn credentials_lock() -> &'static Mutex<()> {
+    CREDENTIALS_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+// ───────────────────────── path helpers ─────────────────────────
+
+fn data_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("OpenTypelessHarness"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").context("APPDATA not set")?;
+        Ok(PathBuf::from(appdata).join("OpenTypelessHarness"))
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return Ok(PathBuf::from(xdg).join("OpenTypelessHarness"));
+            }
+        }
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("OpenTypelessHarness"))
+    }
+}
+
+fn ensure_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("create dir failed: {}", dir.display()))?;
+    Ok(())
+}
+
+/// Atomic write: write to `*.tmp` first, then rename onto the target path.
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, contents)
+        .with_context(|| format!("write tmp failed: {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).with_context(|| format!("rename failed: {}", path.display()))?;
+    Ok(())
+}
+
+fn read_or_default<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    let bytes = fs::read(path).with_context(|| format!("read failed: {}", path.display()))?;
+    if bytes.is_empty() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice::<T>(&bytes)
+        .with_context(|| format!("decode failed: {}", path.display()))
+}
+
+// ───────────────────────── credentials JSON store ─────────────────────────
+//
+// 与 Swift `Sources/OpenLessPersistence/CredentialsVault.swift` 同源——纯 JSON 文件，
+// 路径 `~/.openless/credentials.json`，权限 0600。**故意不用 Keychain**：
+// ad-hoc 签名每次构建 hash 都变，Keychain ACL 失效后会触发逐账号弹框；用户已明确
+// 选择"直接写本地文件"。
+//
+// v1 schema：
+//   {
+//     "version": 1,
+//     "active": { "asr": "<id>", "llm": "<id>" },
+//     "providers": {
+//       "asr": { "<id>": { "appKey", "accessKey", "resourceId", "apiKey", "baseURL", "model" } },
+//       "llm": { "<id>": { "displayName", "apiKey", "baseURL", "model", "temperature", "extraHeaders" } }
+//     }
+//   }
+//
+// "ark.api_key"/"volcengine.app_key" 等账户名按 Swift 语义路由到 active provider。
+
+use std::collections::HashMap;
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[allow(non_snake_case)]
+struct CredsRoot {
+    #[serde(default = "credsroot_default_version")]
+    version: u32,
+    #[serde(default)]
+    active: CredsActive,
+    #[serde(default)]
+    providers: CredsProviders,
+}
+
+fn credsroot_default_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct CredsActive {
+    #[serde(default = "creds_default_asr")]
+    asr: String,
+    #[serde(default = "creds_default_llm")]
+    llm: String,
+}
+
+impl Default for CredsActive {
+    fn default() -> Self {
+        Self {
+            asr: creds_default_asr(),
+            llm: creds_default_llm(),
+        }
+    }
+}
+
+fn creds_default_asr() -> String {
+    "volcengine".into()
+}
+fn creds_default_llm() -> String {
+    "ark".into()
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+struct CredsProviders {
+    #[serde(default)]
+    asr: HashMap<String, CredsAsrEntry>,
+    #[serde(default)]
+    llm: HashMap<String, CredsLlmEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[allow(non_snake_case)]
+struct CredsAsrEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apiKey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseURL: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    appKey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accessKey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resourceId: Option<String>,
+}
+
+impl CredsAsrEntry {
+    fn is_empty(&self) -> bool {
+        self.apiKey.as_deref().unwrap_or("").is_empty()
+            && self.baseURL.as_deref().unwrap_or("").is_empty()
+            && self.model.as_deref().unwrap_or("").is_empty()
+            && self.appKey.as_deref().unwrap_or("").is_empty()
+            && self.accessKey.as_deref().unwrap_or("").is_empty()
+            && self.resourceId.as_deref().unwrap_or("").is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[allow(non_snake_case)]
+struct CredsLlmEntry {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    displayName: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apiKey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    baseURL: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extraHeaders: Option<HashMap<String, String>>,
+}
+
+impl CredsLlmEntry {
+    fn is_empty(&self) -> bool {
+        self.displayName.as_deref().unwrap_or("").is_empty()
+            && self.apiKey.as_deref().unwrap_or("").is_empty()
+            && self.baseURL.as_deref().unwrap_or("").is_empty()
+            && self.model.as_deref().unwrap_or("").is_empty()
+            && self.temperature.is_none()
+            && self
+                .extraHeaders
+                .as_ref()
+                .map(|h| h.is_empty())
+                .unwrap_or(true)
+    }
+}
+
+fn credentials_path() -> Result<PathBuf> {
+    // macOS / Linux: ~/.openless/credentials.json (与 Swift 同源)
+    // Windows: %APPDATA%\OpenTypelessHarness\credentials.json (Windows 没有标准 HOME 环境变量)
+    #[cfg(target_os = "windows")]
+    {
+        let appdata = std::env::var("APPDATA").context("APPDATA not set")?;
+        return Ok(PathBuf::from(appdata)
+            .join("OpenTypelessHarness")
+            .join(LEGACY_CREDS_FILE));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let home = std::env::var("HOME").context("HOME not set")?;
+        Ok(PathBuf::from(home)
+            .join(LEGACY_CREDS_DIR)
+            .join(LEGACY_CREDS_FILE))
+    }
+}
+
+fn ensure_credentials_dir(path: &Path) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("create dir {} failed", dir.display()))?;
+        // 0700 on parent so other users can't peek
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        }
+    }
+    Ok(())
+}
+
+fn load_credentials() -> CredsRoot {
+    let path = match credentials_path() {
+        Ok(p) => p,
+        Err(_) => return CredsRoot::default(),
+    };
+    if !path.exists() {
+        return CredsRoot::default();
+    }
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("[vault] read {} failed: {}", path.display(), e);
+            return CredsRoot::default();
+        }
+    };
+    serde_json::from_slice::<CredsRoot>(&bytes).unwrap_or_else(|e| {
+        log::warn!("[vault] parse {} failed: {}", path.display(), e);
+        CredsRoot::default()
+    })
+}
+
+fn save_credentials(root: &CredsRoot) -> Result<()> {
+    let path = credentials_path()?;
+    ensure_credentials_dir(&path)?;
+    // 写盘前过滤掉空 entry，保持 JSON 干净（mirrors Swift cleanedSchema）。
+    let mut cleaned = root.clone();
+    cleaned.providers.asr.retain(|_, v| !v.is_empty());
+    cleaned.providers.llm.retain(|_, v| !v.is_empty());
+    let json = serde_json::to_vec_pretty(&cleaned).context("encode credentials failed")?;
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &json).with_context(|| format!("write {} failed", tmp.display()))?;
+    fs::rename(&tmp, &path).with_context(|| format!("rename to {} failed", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn lookup_account(root: &CredsRoot, account: CredentialAccount) -> Option<String> {
+    let asr = root.providers.asr.get(&root.active.asr);
+    let llm = root.providers.llm.get(&root.active.llm);
+    let pick = |s: &Option<String>| s.as_ref().filter(|v| !v.is_empty()).cloned();
+    match account {
+        CredentialAccount::VolcengineAppKey => {
+            asr.and_then(|e| pick(&e.appKey).or_else(|| pick(&e.apiKey)))
+        }
+        CredentialAccount::VolcengineAccessKey => asr.and_then(|e| pick(&e.accessKey)),
+        CredentialAccount::VolcengineResourceId => asr.and_then(|e| pick(&e.resourceId)),
+        CredentialAccount::ArkApiKey => llm.and_then(|e| pick(&e.apiKey)),
+        CredentialAccount::ArkModelId => llm.and_then(|e| pick(&e.model)),
+        CredentialAccount::ArkEndpoint => llm.and_then(|e| pick(&e.baseURL)),
+        CredentialAccount::AsrApiKey => asr.and_then(|e| pick(&e.apiKey)),
+        CredentialAccount::AsrEndpoint => asr.and_then(|e| pick(&e.baseURL)),
+        CredentialAccount::AsrModel => asr.and_then(|e| pick(&e.model)),
+    }
+}
+
+fn write_account(root: &mut CredsRoot, account: CredentialAccount, value: Option<String>) {
+    let asr_id = root.active.asr.clone();
+    let llm_id = root.active.llm.clone();
+    let normalized = value.and_then(|v| if v.is_empty() { None } else { Some(v) });
+    match account {
+        CredentialAccount::VolcengineAppKey => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.appKey = normalized;
+        }
+        CredentialAccount::VolcengineAccessKey => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.accessKey = normalized;
+        }
+        CredentialAccount::VolcengineResourceId => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.resourceId = normalized;
+        }
+        CredentialAccount::ArkApiKey => {
+            let entry = root.providers.llm.entry(llm_id).or_default();
+            entry.apiKey = normalized;
+        }
+        CredentialAccount::ArkModelId => {
+            let entry = root.providers.llm.entry(llm_id).or_default();
+            entry.model = normalized;
+        }
+        CredentialAccount::ArkEndpoint => {
+            let entry = root.providers.llm.entry(llm_id).or_default();
+            entry.baseURL = normalized;
+        }
+        CredentialAccount::AsrApiKey => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.apiKey = normalized;
+        }
+        CredentialAccount::AsrEndpoint => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.baseURL = normalized;
+        }
+        CredentialAccount::AsrModel => {
+            let entry = root.providers.asr.entry(asr_id).or_default();
+            entry.model = normalized;
+        }
+    }
+}
+
+// ───────────────────────── HistoryStore ─────────────────────────
+
+pub struct HistoryStore {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl HistoryStore {
+    pub fn new() -> Result<Self> {
+        let dir = data_dir()?;
+        ensure_dir(&dir)?;
+        Ok(Self {
+            path: dir.join(HISTORY_FILE),
+            lock: Mutex::new(()),
+        })
+    }
+
+    pub fn list(&self) -> Result<Vec<DictationSession>> {
+        let _guard = self.lock.lock();
+        self.read_locked()
+    }
+
+    pub fn append(&self, session: DictationSession) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut sessions = self.read_locked()?;
+        // Prepend so the newest session is at index 0, matching the Swift impl.
+        sessions.insert(0, session);
+        if sessions.len() > HISTORY_CAP {
+            sessions.truncate(HISTORY_CAP);
+        }
+        self.write_locked(&sessions)
+    }
+
+    pub fn delete(&self, id: &str) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut sessions = self.read_locked()?;
+        let original_len = sessions.len();
+        sessions.retain(|s| s.id != id);
+        if sessions.len() == original_len {
+            return Ok(());
+        }
+        self.write_locked(&sessions)
+    }
+
+    pub fn clear(&self) -> Result<()> {
+        let _guard = self.lock.lock();
+        self.write_locked(&Vec::<DictationSession>::new())
+    }
+
+    fn read_locked(&self) -> Result<Vec<DictationSession>> {
+        read_or_default::<Vec<DictationSession>>(&self.path)
+    }
+
+    fn write_locked(&self, sessions: &[DictationSession]) -> Result<()> {
+        let json = serde_json::to_vec_pretty(sessions).context("encode history failed")?;
+        atomic_write(&self.path, &json)
+    }
+}
+
+// ───────────────────────── PreferencesStore ─────────────────────────
+
+pub struct PreferencesStore {
+    path: PathBuf,
+    state: Mutex<UserPreferences>,
+}
+
+impl PreferencesStore {
+    pub fn new() -> Result<Self> {
+        let dir = data_dir()?;
+        ensure_dir(&dir)?;
+        let path = dir.join(PREFERENCES_FILE);
+        let prefs = if path.exists() {
+            read_or_default::<UserPreferences>(&path).unwrap_or_default()
+        } else {
+            UserPreferences::default()
+        };
+        Ok(Self {
+            path,
+            state: Mutex::new(prefs),
+        })
+    }
+
+    pub fn get(&self) -> UserPreferences {
+        self.state.lock().clone()
+    }
+
+    pub fn set(&self, prefs: UserPreferences) -> Result<()> {
+        let json = serde_json::to_vec_pretty(&prefs).context("encode prefs failed")?;
+        atomic_write(&self.path, &json)?;
+        let mut guard = self.state.lock();
+        *guard = prefs;
+        Ok(())
+    }
+}
+
+// ───────────────────────── DictionaryStore ─────────────────────────
+
+pub struct DictionaryStore {
+    path: PathBuf,
+    lock: Mutex<()>,
+}
+
+impl DictionaryStore {
+    pub fn new() -> Result<Self> {
+        let dir = data_dir()?;
+        ensure_dir(&dir)?;
+        Ok(Self {
+            path: dir.join(VOCAB_FILE),
+            lock: Mutex::new(()),
+        })
+    }
+
+    pub fn list(&self) -> Result<Vec<DictionaryEntry>> {
+        let _guard = self.lock.lock();
+        self.read_locked()
+    }
+
+    pub fn add(&self, phrase: String, note: Option<String>) -> Result<DictionaryEntry> {
+        let _guard = self.lock.lock();
+        let mut entries = self.read_locked()?;
+        let entry = DictionaryEntry {
+            id: Uuid::new_v4().to_string(),
+            phrase,
+            note,
+            enabled: true,
+            hits: 0,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        entries.insert(0, entry.clone());
+        self.write_locked(&entries)?;
+        Ok(entry)
+    }
+
+    pub fn remove(&self, id: &str) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut entries = self.read_locked()?;
+        let before = entries.len();
+        entries.retain(|e| e.id != id);
+        if entries.len() == before {
+            return Ok(());
+        }
+        self.write_locked(&entries)
+    }
+
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let _guard = self.lock.lock();
+        let mut entries = self.read_locked()?;
+        let mut found = false;
+        for entry in entries.iter_mut() {
+            if entry.id == id {
+                entry.enabled = enabled;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(anyhow!("dictionary entry {} not found", id));
+        }
+        self.write_locked(&entries)
+    }
+
+    /// 扫描一段最终文本，对每个 enabled 词条按出现次数累加 `hits`。
+    ///
+    /// 匹配是大小写不敏感的子串扫描：「Hello hello HELLO」算 3 次。
+    /// 返回本次累加的总命中数，方便调用方记录到 history.dictionary_entry_count。
+    pub fn record_hits(&self, text: &str) -> Result<u64> {
+        if text.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self.lock.lock();
+        let mut entries = self.read_locked()?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let haystack = text.to_lowercase();
+        let mut total: u64 = 0;
+        let mut changed = false;
+        for entry in entries.iter_mut() {
+            if !entry.enabled {
+                continue;
+            }
+            let needle = entry.phrase.trim().to_lowercase();
+            if needle.is_empty() {
+                continue;
+            }
+            let count = count_occurrences(&haystack, &needle);
+            if count > 0 {
+                entry.hits = entry.hits.saturating_add(count);
+                total = total.saturating_add(count);
+                changed = true;
+            }
+        }
+        if changed {
+            self.write_locked(&entries)?;
+        }
+        Ok(total)
+    }
+
+    fn read_locked(&self) -> Result<Vec<DictionaryEntry>> {
+        read_or_default::<Vec<DictionaryEntry>>(&self.path)
+    }
+
+    fn write_locked(&self, entries: &[DictionaryEntry]) -> Result<()> {
+        let json = serde_json::to_vec_pretty(entries).context("encode vocab failed")?;
+        atomic_write(&self.path, &json)
+    }
+}
+
+/// 统计 `needle` 在 `haystack` 中的非重叠出现次数。两侧调用前都应已转小写。
+fn count_occurrences(haystack: &str, needle: &str) -> u64 {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    let mut count: u64 = 0;
+    let mut start = 0usize;
+    while let Some(pos) = haystack[start..].find(needle) {
+        count = count.saturating_add(1);
+        start = start + pos + needle.len();
+        if start >= haystack.len() {
+            break;
+        }
+    }
+    count
+}
+
+pub fn list_vocab_presets() -> Result<VocabPresetStore> {
+    let dir = data_dir()?;
+    ensure_dir(&dir)?;
+    read_or_default::<VocabPresetStore>(&dir.join(VOCAB_PRESETS_FILE))
+}
+
+pub fn save_vocab_presets(store: &VocabPresetStore) -> Result<()> {
+    let dir = data_dir()?;
+    ensure_dir(&dir)?;
+    let path = dir.join(VOCAB_PRESETS_FILE);
+    let json = serde_json::to_vec_pretty(store).context("encode vocab presets failed")?;
+    atomic_write(&path, &json)
+}
+
+// ───────────────────────── CredentialsVault ─────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CredentialAccount {
+    VolcengineAppKey,
+    VolcengineAccessKey,
+    VolcengineResourceId,
+    ArkApiKey,
+    ArkModelId,
+    ArkEndpoint,
+    /// Active ASR provider's API key (used by Whisper-compatible providers).
+    AsrApiKey,
+    /// Active ASR provider's base URL.
+    AsrEndpoint,
+    /// Active ASR provider's model name.
+    AsrModel,
+}
+
+impl CredentialAccount {
+    /// Account names match the Swift `CredentialAccount` constants exactly so
+    /// existing Keychain entries written by the macOS Swift app remain
+    /// readable after upgrade.
+    pub fn keyring_account(&self) -> &'static str {
+        match self {
+            CredentialAccount::VolcengineAppKey => "volcengine.app_key",
+            CredentialAccount::VolcengineAccessKey => "volcengine.access_key",
+            CredentialAccount::VolcengineResourceId => "volcengine.resource_id",
+            CredentialAccount::ArkApiKey => "ark.api_key",
+            CredentialAccount::ArkModelId => "ark.model_id",
+            CredentialAccount::ArkEndpoint => "ark.endpoint",
+            CredentialAccount::AsrApiKey => "asr.api_key",
+            CredentialAccount::AsrEndpoint => "asr.endpoint",
+            CredentialAccount::AsrModel => "asr.model",
+        }
+    }
+
+    pub fn all() -> &'static [CredentialAccount] {
+        &[
+            CredentialAccount::VolcengineAppKey,
+            CredentialAccount::VolcengineAccessKey,
+            CredentialAccount::VolcengineResourceId,
+            CredentialAccount::ArkApiKey,
+            CredentialAccount::ArkModelId,
+            CredentialAccount::ArkEndpoint,
+            CredentialAccount::AsrApiKey,
+            CredentialAccount::AsrEndpoint,
+            CredentialAccount::AsrModel,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialsSnapshot {
+    pub volcengine_app_key: Option<String>,
+    pub volcengine_access_key: Option<String>,
+    pub volcengine_resource_id: Option<String>,
+    pub ark_api_key: Option<String>,
+    pub ark_model_id: Option<String>,
+    pub ark_endpoint: Option<String>,
+}
+
+/// 凭据存储——纯 JSON 文件，**不**走 Keychain。详见文件头部注释。
+pub struct CredentialsVault;
+
+impl CredentialsVault {
+    /// 历史保留：Swift 时代以此名作为 Keychain service。Rust 不再使用 Keychain，
+    /// 但暴露此常量给可能仍依赖它的代码点。
+    pub const SERVICE_NAME: &'static str = "dev.openclaudex.opentypeless.harness";
+
+    pub fn get(account: CredentialAccount) -> Result<Option<String>> {
+        let _guard = credentials_lock().lock();
+        Ok(lookup_account(&load_credentials(), account))
+    }
+
+    pub fn set(account: CredentialAccount, value: &str) -> Result<()> {
+        let _guard = credentials_lock().lock();
+        let mut root = load_credentials();
+        let v = if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        };
+        write_account(&mut root, account, v);
+        save_credentials(&root)
+    }
+
+    pub fn remove(account: CredentialAccount) -> Result<()> {
+        let _guard = credentials_lock().lock();
+        let mut root = load_credentials();
+        write_account(&mut root, account, None);
+        save_credentials(&root)
+    }
+
+    pub fn get_active_asr() -> String {
+        let _guard = credentials_lock().lock();
+        load_credentials().active.asr
+    }
+
+    pub fn set_active_asr_provider(id: &str) -> Result<()> {
+        let _guard = credentials_lock().lock();
+        let mut root = load_credentials();
+        root.active.asr = id.to_string();
+        save_credentials(&root)
+    }
+
+    pub fn set_active_llm_provider(id: &str) -> Result<()> {
+        let _guard = credentials_lock().lock();
+        let mut root = load_credentials();
+        root.active.llm = id.to_string();
+        save_credentials(&root)
+    }
+
+    pub fn snapshot() -> CredentialsSnapshot {
+        let _guard = credentials_lock().lock();
+        let root = load_credentials();
+        CredentialsSnapshot {
+            volcengine_app_key: lookup_account(&root, CredentialAccount::VolcengineAppKey),
+            volcengine_access_key: lookup_account(&root, CredentialAccount::VolcengineAccessKey),
+            volcengine_resource_id: lookup_account(&root, CredentialAccount::VolcengineResourceId),
+            ark_api_key: lookup_account(&root, CredentialAccount::ArkApiKey),
+            ark_model_id: lookup_account(&root, CredentialAccount::ArkModelId),
+            ark_endpoint: lookup_account(&root, CredentialAccount::ArkEndpoint),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{list_vocab_presets, save_vocab_presets};
+    use crate::types::{VocabPreset, VocabPresetStore};
+    use std::fs;
+    use std::path::PathBuf;
+
+    #[test]
+    fn vocab_presets_roundtrip_json_file() {
+        let tmp: PathBuf =
+            std::env::temp_dir().join(format!("openless-test-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp).expect("create temp dir");
+        // Linux path helper uses XDG_DATA_HOME first.
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
+        let store = VocabPresetStore {
+            custom: vec![VocabPreset {
+                id: "test".into(),
+                name: "测试".into(),
+                phrases: vec!["PR".into(), "CI".into()],
+            }],
+            overrides: vec![],
+            disabled_builtin_preset_ids: vec!["chef".into()],
+        };
+        save_vocab_presets(&store).expect("save presets");
+        let loaded = list_vocab_presets().expect("list presets");
+        assert_eq!(loaded.custom.len(), 1);
+        assert_eq!(loaded.custom[0].id, "test");
+        assert_eq!(
+            loaded.custom[0].phrases,
+            vec!["PR".to_string(), "CI".to_string()]
+        );
+        assert_eq!(loaded.disabled_builtin_preset_ids, vec!["chef".to_string()]);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

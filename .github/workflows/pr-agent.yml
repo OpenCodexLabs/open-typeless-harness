@@ -1,0 +1,53 @@
+name: PR-Agent
+
+on:
+  # 使用 pull_request_target，让外部 PR 也能读取仓库 Secrets，并获得声明的写权限。
+  # 本 workflow 不 checkout / 执行 PR 分支代码，只让 PR-Agent 通过 GitHub API 读取 diff。
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+jobs:
+  pr_agent_job:
+    if: ${{ github.event.sender.type != 'Bot' && (github.event_name != 'issue_comment' || github.event.issue.pull_request) }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      issues: write
+      pull-requests: write
+      contents: read
+
+    steps:
+      - name: Run PR Agent
+        uses: the-pr-agent/pr-agent@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # 同时兼容 PR-Agent 旧写法和 OpenAI-like 新写法
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          OPENAI__KEY: ${{ secrets.OPENAI_KEY }}
+          OPENAI.API_BASE: "https://cpa.chris233.qzz.io/v1"
+          OPENAI__API_BASE: "https://cpa.chris233.qzz.io/v1"
+          OPENAI_API_BASE: "https://cpa.chris233.qzz.io/v1"
+          OPENAI_BASE_URL: "https://cpa.chris233.qzz.io/v1"
+
+          # 中文输出
+          pr_reviewer.response_language: "zh-CN"
+          pr_description.response_language: "zh-CN"
+          pr_code_suggestions.response_language: "zh-CN"
+
+          # 模型配置
+          config.model: "openai/deepseek-v4-pro"
+          config.fallback_models: '["openai/gpt-5.4-mini"]'
+          config.custom_model_max_tokens: "1048576"
+          # GPT-5 fallback 不接受 temperature=0.2，保持 1 避免 LiteLLM 参数错误。
+          config.temperature: "1"
+
+          # 自动执行配置
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "false"
+
+          # 允许 synchronize 事件触发 PR-Agent
+          github_action_config.pr_actions: '["opened", "reopened", "ready_for_review", "synchronize"]'

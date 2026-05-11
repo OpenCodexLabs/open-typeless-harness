@@ -1,0 +1,849 @@
+#![allow(clashing_extern_declarations)]
+
+//! Open Typeless Harness Tauri backend.
+//!
+//! Modules mirror the original Swift libraries (one purpose per file):
+//! - hotkey: global hotkey monitor
+//! - recorder: microphone capture (16 kHz mono Int16 PCM)
+//! - asr: streaming ASR providers (Volcengine SAUC bigmodel)
+//! - polish: OpenAI-compatible chat completions client
+//! - insertion: cursor-position text insertion (AX / paste)
+//! - persistence: history + preferences + credentials vault
+//! - coordinator: dictation state machine glue
+//! - commands: Tauri IPC surface
+
+mod asr;
+mod commands;
+mod coordinator;
+pub mod edit_monitor;
+mod hotkey;
+mod insertion;
+mod learning_probe;
+mod permissions;
+mod persistence;
+mod polish;
+mod qa_hotkey;
+mod recorder;
+mod selection;
+mod types;
+mod vih_bridge;
+mod windows_ime_ipc;
+mod windows_ime_profile;
+mod windows_ime_protocol;
+mod windows_ime_session;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+
+/// 第一次 show 时把 QA 浮窗摆到屏幕底部居中；之后的 show 不再 reposition，
+/// 让用户拖动后的位置在 hide → show 之间得以保持。详见 issue #118 v2。
+static QA_WINDOW_POSITIONED: AtomicBool = AtomicBool::new(false);
+use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Runtime};
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    init_file_logger();
+    log::info!("=== Open Typeless Harness 启动 ===");
+
+    let coordinator = Arc::new(coordinator::Coordinator::new());
+
+    tauri::Builder::default()
+        // 单实例锁：第二个进程启动时立即退出，激活信号转给已运行实例的主窗口。
+        // 否则两份 OpenLess（如 /Applications/ + dev build）会各自抓全局热键，
+        // 导致按一次键、两个进程同时跑流水线、文本被插入两遍。见 issue #50。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!(
+                "[single-instance] another instance launched, focusing existing main window"
+            );
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // 跨平台开机自启：mac 写 LaunchAgent plist，linux 写 ~/.config/autostart/*.desktop，
+        // windows 写 HKCU\Software\Microsoft\Windows\CurrentVersion\Run。前端 toggle 直接
+        // 调插件 isEnabled / enable / disable，不维持本地 prefs，让 OS 当唯一真相。issue #194。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .manage(coordinator.clone())
+        .setup(move |app| {
+            // Capsule 启动时定位到屏幕底部居中并隐藏；coordinator 按需显示。
+            // 与 Swift `CapsuleWindowController.repositionToBottomCenter` 同语义。
+            if let Some(capsule) = app.get_webview_window("capsule") {
+                if let Err(e) = position_capsule_bottom_center(&capsule, false) {
+                    log::warn!("[capsule] position failed: {e}");
+                }
+                let _ = capsule.hide();
+            }
+
+            // QA 浮窗（issue #118）：紧贴胶囊上方 8pt、屏幕底部居中、380×440。
+            // 启动时 hide()，等 coordinator 在 open_qa_panel 时再 show + 首次定位。
+            // tauri.conf.json 里需要声明 label="qa" 的窗口（前端 agent 负责）；
+            // 这里 get_webview_window 返回 None 时直接跳过，不影响主流程。
+            if let Some(qa) = app.get_webview_window("qa") {
+                if let Err(e) = position_qa_window(&qa) {
+                    log::warn!("[qa] position failed: {e}");
+                }
+                #[cfg(target_os = "macos")]
+                make_qa_window_draggable_macos(&qa);
+                let _ = qa.hide();
+            } else {
+                log::info!("[qa] qa 窗口未在 tauri.conf.json 中声明，前端 agent 会补上");
+            }
+
+            // 主窗口磨砂：macOS 用 NSVisualEffectView，Windows 用 Mica。
+            // 没这一层的话 transparent: true 让窗口透明 → 背后只是空，不是磨砂。
+            //
+            // decorations 留给运行时分平台决定：macOS 默认 true 用系统红黄绿；
+            // Windows 这里关掉 native chrome 让 React 端 WinTitleBar 接管。
+            if let Some(main) = app.get_webview_window("main") {
+                #[cfg(target_os = "macos")]
+                {
+                    use window_vibrancy::{
+                        apply_vibrancy, NSVisualEffectMaterial, NSVisualEffectState,
+                    };
+                    if let Err(e) = main.set_decorations(true) {
+                        log::warn!("[main] enable native decorations failed: {e}");
+                    }
+                    if let Err(e) = apply_vibrancy(
+                        &main,
+                        NSVisualEffectMaterial::HudWindow,
+                        Some(NSVisualEffectState::Active),
+                        Some(20.0),
+                    ) {
+                        log::warn!("[main] vibrancy failed: {e}");
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    use window_vibrancy::apply_mica;
+                    // The window starts hidden so Windows native chrome can be disabled before
+                    // the first show; doing this after the native frame is visible is unreliable.
+                    if let Err(e) = main.set_decorations(false) {
+                        log::warn!("[main] disable native decorations failed: {e}");
+                    }
+                    if let Err(e) = apply_mica(&main, None) {
+                        log::warn!("[main] mica failed: {e}");
+                    }
+                    apply_windows_rounded_frame(&main);
+                }
+                if let Err(e) = main.show() {
+                    log::warn!("[main] initial show failed: {e}");
+                }
+            }
+
+            // 启动时主动弹 Accessibility 授权框（与 Swift `AppDelegate` 行为一致）。
+            // 用户首次必看到系统提示；已授权则静默返回。
+            #[cfg(target_os = "macos")]
+            {
+                let status = permissions::request_accessibility();
+                log::info!("[startup] Accessibility status = {:?}", status);
+            }
+
+            // 菜单栏图标 — 与 Swift `MenuBarController` 同语义：
+            // 左键点 → 显示/聚焦主窗口；菜单含「显示主窗口」「退出」。
+            let toggle = MenuItemBuilder::with_id("toggle", "显示主窗口").build(app)?;
+            let quit = MenuItemBuilder::with_id("quit", "退出 Open Typeless Harness").build(app)?;
+            let menu = MenuBuilder::new(app).items(&[&toggle, &quit]).build()?;
+
+            // 与 Swift `StatusBarIcon.swift` 行为一致：用全彩 AppIcon，**不**走 template 模式
+            // （走 template 会被 macOS 染成单色 → 看起来像个黑方块）。
+            if let Some(icon) = app.default_window_icon() {
+                let _tray = TrayIconBuilder::with_id("main-tray")
+                    .icon(icon.clone())
+                    .icon_as_template(false)
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "toggle" => show_main_window(app),
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            ..
+                        } = event
+                        {
+                            show_main_window(tray.app_handle());
+                        }
+                    })
+                    .build(app)?;
+            } else {
+                log::warn!("[startup] default window icon missing; tray icon disabled");
+            }
+
+            // Spin up hotkey listener; coordinator owns the lifecycle.
+            let app_handle = app.handle().clone();
+            coordinator.bind_app(app_handle);
+            coordinator.start_hotkey_listener();
+            // 同步启动 QA hotkey listener。和 dictation hotkey 平行，互不抢状态。
+            coordinator.start_qa_hotkey_listener();
+            if std::env::var("OPENLESS_SHOW_MAIN_ON_START").ok().as_deref() == Some("1") {
+                show_main_window(app.handle());
+            }
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_settings,
+            commands::set_settings,
+            commands::get_hotkey_status,
+            commands::get_hotkey_capability,
+            commands::get_windows_ime_status,
+            commands::get_credentials,
+            commands::set_credential,
+            commands::list_history,
+            commands::delete_history_entry,
+            commands::clear_history,
+            commands::list_vocab,
+            commands::add_vocab,
+            commands::remove_vocab,
+            commands::set_vocab_enabled,
+            commands::list_vocab_presets,
+            commands::save_vocab_presets,
+            commands::start_dictation,
+            commands::stop_dictation,
+            commands::cancel_dictation,
+            commands::handle_window_hotkey_event,
+            #[cfg(debug_assertions)]
+            commands::inject_hotkey_click_for_dev,
+            commands::repolish,
+            commands::set_default_polish_mode,
+            commands::set_style_enabled,
+            commands::check_accessibility_permission,
+            commands::request_accessibility_permission,
+            commands::check_microphone_permission,
+            commands::request_microphone_permission,
+            commands::open_system_settings,
+            commands::trigger_microphone_prompt,
+            commands::read_credential,
+            commands::set_active_asr_provider,
+            commands::set_active_llm_provider,
+            commands::get_qa_hotkey_label,
+            commands::set_qa_hotkey,
+            commands::qa_window_dismiss,
+            commands::qa_window_pin,
+            commands::validate_provider_credentials,
+            commands::list_provider_models,
+            restart_app,
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => show_main_window(app),
+            RunEvent::WindowEvent { label, event, .. } => {
+                if label == "main" {
+                    if let tauri::WindowEvent::CloseRequested { ref api, .. } = event {
+                        api.prevent_close();
+                        hide_main_window(app);
+                    }
+                    #[cfg(target_os = "windows")]
+                    if matches!(
+                        event,
+                        tauri::WindowEvent::Resized(_)
+                            | tauri::WindowEvent::ScaleFactorChanged { .. }
+                    ) {
+                        if let Some(main) = app.get_webview_window("main") {
+                            apply_windows_rounded_frame(&main);
+                        }
+                    }
+                }
+            }
+            RunEvent::Exit => {
+                let coordinator = app.state::<Arc<coordinator::Coordinator>>();
+                coordinator.stop_hotkey_listener();
+                coordinator.stop_qa_hotkey_listener();
+            }
+            _ => {}
+        });
+}
+
+#[cfg(target_os = "windows")]
+fn apply_windows_rounded_frame<R: Runtime>(window: &tauri::WebviewWindow<R>) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::{BOOL, HWND, RECT};
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    };
+    use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn, HRGN};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, GetWindowRect, SetWindowLongW, SetWindowPos, GWL_STYLE, SWP_FRAMECHANGED,
+        SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION, WS_THICKFRAME,
+    };
+
+    let handle = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(handle)) => handle,
+        Ok(other) => {
+            log::warn!("[main] unexpected raw window handle for DWM frame: {other:?}");
+            return;
+        }
+        Err(e) => {
+            log::warn!("[main] read raw window handle failed: {e}");
+            return;
+        }
+    };
+    let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+
+    unsafe {
+        let style = GetWindowLongW(hwnd, GWL_STYLE);
+        let desired_style = (style | WS_THICKFRAME.0 as i32) & !(WS_CAPTION.0 as i32);
+        if style != desired_style {
+            SetWindowLongW(hwnd, GWL_STYLE, desired_style);
+            if let Err(e) = SetWindowPos(
+                hwnd,
+                HWND::default(),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+            ) {
+                log::warn!("[main] refresh native frame after style update failed: {e}");
+            }
+        }
+
+        if window.is_maximized().unwrap_or(false) {
+            let _ = SetWindowRgn(hwnd, HRGN::default(), BOOL(1));
+            return;
+        }
+
+        let corner_preference = DWMWCP_ROUND;
+        if let Err(e) = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &corner_preference as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&corner_preference) as u32,
+        ) {
+            log::warn!("[main] set DWM rounded corners failed: {e}");
+        }
+
+        // Remove DWM's fallback 1px light border; the React shell draws the visual stroke.
+        let border_color_none: u32 = 0xFFFFFFFE;
+        if let Err(e) = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &border_color_none as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&border_color_none) as u32,
+        ) {
+            log::warn!("[main] remove DWM border color failed: {e}");
+        }
+
+        let mut rect = RECT::default();
+        if let Err(e) = GetWindowRect(hwnd, &mut rect) {
+            log::warn!("[main] read window rect for rounded region failed: {e}");
+            return;
+        }
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 18, 18);
+        if region.is_invalid() {
+            log::warn!("[main] create rounded window region failed");
+            return;
+        }
+        if SetWindowRgn(hwnd, region, BOOL(1)) == 0 {
+            log::warn!("[main] apply rounded window region failed");
+        }
+    }
+}
+
+#[tauri::command]
+fn restart_app(app: AppHandle) {
+    // macOS：自动更新会让新装的 .app 带 com.apple.quarantine（无论 Tauri updater
+    // 怎么解包，下载流由 LaunchServices 接管，输出物可能仍带 xattr）。如果不
+    // strip，重启后 Gatekeeper 会拦着说"OpenLess 已损坏 / 来自未识别开发者"，
+    // 用户必须自己开终端跑 xattr -cr 才能继续用 — 违反了"自动更新对用户应该零摩擦"。
+    //
+    // 在 restart 前阻塞地清一次 xattr。失败容忍（PATH 异常、xattr 不存在、磁盘
+    // 只读等边角情况），不让它阻塞重启本身。
+    #[cfg(target_os = "macos")]
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bundle) = exe
+            .ancestors()
+            .find(|p| p.extension().map(|e| e == "app").unwrap_or(false))
+        {
+            let _ = std::process::Command::new("/usr/bin/xattr")
+                .arg("-cr")
+                .arg(bundle)
+                .status();
+            log::info!("[updater] stripped xattr on {:?} before restart", bundle);
+        }
+    }
+    app.restart();
+}
+
+/// 把日志同时写到 stderr + app-specific log file。
+fn init_file_logger() {
+    use simplelog::{
+        ColorChoice, CombinedLogger, ConfigBuilder, LevelFilter, TermLogger, TerminalMode,
+        WriteLogger,
+    };
+    let log_dir = log_dir_path();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_file = log_dir.join("open-typeless-harness.log");
+    let config = ConfigBuilder::new().set_time_format_rfc3339().build();
+    let mut loggers: Vec<Box<dyn simplelog::SharedLogger>> = vec![TermLogger::new(
+        LevelFilter::Info,
+        config.clone(),
+        TerminalMode::Mixed,
+        ColorChoice::Auto,
+    )];
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+    {
+        loggers.push(WriteLogger::new(LevelFilter::Info, config, file));
+    }
+    let _ = CombinedLogger::init(loggers);
+}
+
+fn log_dir_path() -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home)
+                .join("Library")
+                .join("Logs")
+                .join("OpenTypelessHarness");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            return std::path::PathBuf::from(local)
+                .join("OpenTypelessHarness")
+                .join("Logs");
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return std::path::PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join("OpenTypelessHarness")
+                .join("logs");
+        }
+    }
+    std::env::temp_dir().join("OpenTypelessHarness")
+}
+
+pub(crate) fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
+    activate_window_mode(app);
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+    activate_app(app);
+}
+
+pub(crate) fn request_microphone_from_foreground<R: Runtime>(
+    app: &AppHandle<R>,
+) -> permissions::PermissionStatus {
+    show_main_window(app);
+    wait_for_app_activation(app);
+    permissions::request_microphone()
+}
+
+fn hide_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+    activate_menu_bar_mode(app);
+}
+
+#[cfg(target_os = "macos")]
+fn activate_window_mode<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+    let _ = app.set_dock_visibility(true);
+    let _ = app.show();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_window_mode<R: Runtime>(_app: &AppHandle<R>) {}
+
+#[cfg(target_os = "macos")]
+fn activate_menu_bar_mode<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+    let _ = app.set_dock_visibility(false);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_menu_bar_mode<R: Runtime>(_app: &AppHandle<R>) {}
+
+#[cfg(target_os = "macos")]
+fn activate_app<R: Runtime>(app: &AppHandle<R>) {
+    let _ = app.run_on_main_thread(|| {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject, Bool};
+
+        unsafe {
+            let Some(cls) = AnyClass::get("NSApplication") else {
+                return;
+            };
+            let ns_app: *mut AnyObject = msg_send![cls, sharedApplication];
+            if !ns_app.is_null() {
+                let _: () = msg_send![ns_app, activateIgnoringOtherApps: Bool::YES];
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_app<R: Runtime>(_app: &AppHandle<R>) {}
+
+/// 展示胶囊后调用：若 OpenLess 已是前台 app，用 makeKeyWindow 还原主窗口焦点。
+/// 不调 NSApp.activate，不抢其他 app 焦点，符合 CLAUDE.md 约束。
+#[cfg(target_os = "macos")]
+pub(crate) fn restore_main_window_key_if_active<R: Runtime>(app: &AppHandle<R>) {
+    let main = app.get_webview_window("main");
+    let _ = app.run_on_main_thread(move || {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject, Bool};
+        unsafe {
+            let Some(cls) = AnyClass::get("NSApplication") else {
+                return;
+            };
+            let ns_app: *mut AnyObject = msg_send![cls, sharedApplication];
+            if ns_app.is_null() {
+                return;
+            }
+            let is_active: Bool = msg_send![ns_app, isActive];
+            if !is_active.as_bool() {
+                return;
+            }
+            let Some(main) = main else {
+                return;
+            };
+            match main.ns_window() {
+                Ok(handle) => {
+                    let main_win = handle as *mut AnyObject;
+                    if !main_win.is_null() {
+                        let _: () = msg_send![main_win, makeKeyWindow];
+                    }
+                }
+                Err(e) => log::warn!("[main] ns_window unavailable for key restore: {e}"),
+            };
+        }
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_app_activation<R: Runtime>(app: &AppHandle<R>) {
+    let (tx, rx) = mpsc::channel();
+    let _ = app.run_on_main_thread(move || {
+        use objc2::msg_send;
+        use objc2::runtime::{AnyClass, AnyObject, Bool};
+
+        unsafe {
+            let Some(cls) = AnyClass::get("NSApplication") else {
+                let _ = tx.send(());
+                return;
+            };
+            let ns_app: *mut AnyObject = msg_send![cls, sharedApplication];
+            if !ns_app.is_null() {
+                let _: () = msg_send![ns_app, activateIgnoringOtherApps: Bool::YES];
+            }
+        }
+        let _ = tx.send(());
+    });
+    let _ = rx.recv_timeout(Duration::from_millis(800));
+    std::thread::sleep(Duration::from_millis(150));
+}
+
+#[cfg(not(target_os = "macos"))]
+fn wait_for_app_activation<R: Runtime>(_app: &AppHandle<R>) {}
+
+/// QA 浮窗的目标尺寸（issue #118）。胶囊默认 220×96 + Dock 80pt + 8pt gap，
+/// 算下来 QA 窗口顶部坐标 = h - 80 - 96 - 8 - 280。
+const QA_WINDOW_WIDTH: f64 = 380.0;
+const QA_WINDOW_HEIGHT: f64 = 440.0;
+/// 胶囊与 QA 窗口的间距，与设计稿一致。
+const QA_WINDOW_GAP_TO_CAPSULE: f64 = 8.0;
+/// 给 macOS Dock 留的下边距（与 capsule 同源）。
+const DOCK_BOTTOM_PADDING_FOR_QA: f64 = 80.0;
+
+/// 把 QA 浮窗放到屏幕底部居中、紧贴胶囊上方。tauri 启动期 + show 之前都会调一次，
+/// 防止用户切换显示器后位置错乱。
+fn position_qa_window<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
+    let monitor = match window.current_monitor()? {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    let scale = monitor.scale_factor();
+    let size = monitor.size();
+    let logical_w = size.width as f64 / scale;
+    let logical_h = size.height as f64 / scale;
+    let capsule_height = capsule_height_for_qa();
+    let x = ((logical_w - QA_WINDOW_WIDTH) / 2.0).max(0.0);
+    let y = (logical_h
+        - DOCK_BOTTOM_PADDING_FOR_QA
+        - capsule_height
+        - QA_WINDOW_GAP_TO_CAPSULE
+        - QA_WINDOW_HEIGHT)
+        .max(0.0);
+    window.set_size(tauri::LogicalSize::new(QA_WINDOW_WIDTH, QA_WINDOW_HEIGHT))?;
+    window.set_position(LogicalPosition::new(x, y))?;
+    Ok(())
+}
+
+/// 显示 QA 窗口并发一条状态事件（前端订阅 `qa:state`）。
+/// `content_kind` 是不透明字符串（"loading" / "answer" / "idle" 等），
+/// 让前端 React 视图自行决定渲染哪一种。**不**抢前台 app 焦点（保证 Cmd+C
+/// fallback 仍能从原 app 拿到选区）。
+pub(crate) fn show_qa_window<R: tauri::Runtime>(app: &AppHandle<R>, content_kind: &str) {
+    let Some(window) = app.get_webview_window("qa") else {
+        log::info!("[qa] show 跳过：qa 窗口不存在 (content_kind={content_kind})");
+        return;
+    };
+    // 仅首次 show 时居中；之后保留用户拖动后的位置。
+    if !QA_WINDOW_POSITIONED.load(Ordering::Relaxed) {
+        if let Err(e) = position_qa_window(&window) {
+            log::warn!("[qa] position before first show failed: {e}");
+        }
+        QA_WINDOW_POSITIONED.store(true, Ordering::Relaxed);
+    }
+    // macOS：不用 window.show()（它会 makeKeyAndOrderFront 把 OpenLess 推成 frontmost，
+    // 之后 capture_selection 的 AX read / Cmd+C fallback 都跑在 OpenLess 自己的 webview 上
+    // → 抓不到原 app 选区）。改用 orderFrontRegardless 让窗口可见但**不**成为 key window，
+    // frontmost 仍是用户原 app，AX 还能读到选区。这是 Spotlight / Raycast 的标准做法。
+    //
+    // ⚠️ 关键：NSWindow 任何操作必须在主线程，macOS 26 是硬断言（违反直接 SIGTRAP）。
+    // show_qa_window 经常从 tokio worker 调（qa_hotkey_bridge_loop），所以裸 ObjC msg_send
+    // 必须用 `app.run_on_main_thread` dispatch 到主线程。详见 issue #118 v2。
+    #[cfg(target_os = "macos")]
+    {
+        let window_clone = window.clone();
+        let _ = app.run_on_main_thread(move || {
+            use objc2::msg_send;
+            use objc2::runtime::AnyObject;
+            match window_clone.ns_window() {
+                Ok(handle) => {
+                    let ns = handle as *mut AnyObject;
+                    if ns.is_null() {
+                        log::warn!("[qa] ns_window null; falling back to window.show()");
+                        let _ = window_clone.show();
+                    } else {
+                        unsafe {
+                            let _: () = msg_send![ns, orderFrontRegardless];
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[qa] ns_window unavailable: {e}; falling back to window.show()");
+                    let _ = window_clone.show();
+                }
+            }
+        });
+    }
+    #[cfg(target_os = "windows")]
+    if !show_qa_window_no_activate(&window) {
+        log::warn!("[qa] show_no_activate failed; falling back to window.show()");
+        if let Err(e) = window.show() {
+            log::warn!("[qa] show fallback failed: {e}");
+        }
+    }
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    if let Err(e) = window.show() {
+        log::warn!("[qa] show failed: {e}");
+    }
+    let _ = app.emit_to(
+        "qa",
+        "qa:state",
+        serde_json::json!({ "kind": content_kind }),
+    );
+}
+
+/// QA 浮窗的拖动修复（macOS）。
+///
+/// 配置 `focus: false` 让 Tauri 把窗口创建为 nonactivating panel 风格（避免抢前台 app
+/// 焦点）。代价是 AppKit 的 `performWindowDragWithEvent:` 在 nonactivating 窗口上无效，
+/// 所以 `data-tauri-drag-region` 和 `WebviewWindow::start_dragging()` 都拖不动。
+///
+/// 解法是把 NSWindow 的 `movableByWindowBackground` 打开——这条路径不依赖窗口是否成为
+/// key window，跟 Spotlight / Raycast 的浮窗是同一手法。设一次就够，整个生命周期保持。
+#[cfg(target_os = "macos")]
+fn make_qa_window_draggable_macos<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    let Ok(handle) = window.ns_window() else {
+        log::warn!("[qa] ns_window unavailable; drag fix skipped");
+        return;
+    };
+    let ns_window = handle as *mut AnyObject;
+    if ns_window.is_null() {
+        log::warn!("[qa] ns_window null; drag fix skipped");
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![ns_window, setMovableByWindowBackground: Bool::YES];
+        let _: () = msg_send![ns_window, setMovable: Bool::YES];
+    }
+    log::info!("[qa] NSWindow movableByWindowBackground=YES");
+}
+
+/// 隐藏 QA 窗口。供 commands::qa_window_dismiss / coordinator session 收尾共用。
+pub(crate) fn hide_qa_window<R: tauri::Runtime>(app: &AppHandle<R>) {
+    if let Some(window) = app.get_webview_window("qa") {
+        let _ = window.hide();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn show_qa_window_no_activate<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> bool {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
+
+    let Ok(handle) = window.window_handle() else {
+        return false;
+    };
+    let RawWindowHandle::Win32(raw) = handle.as_raw() else {
+        return false;
+    };
+    let hwnd = HWND(raw.hwnd.get() as *mut _);
+    if hwnd.0.is_null() {
+        return false;
+    }
+
+    let _ = unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+    true
+}
+
+/// 把 capsule 窗口移到屏幕底部居中，与 Swift `CapsuleWindowController.repositionToBottomCenter` 同效。
+/// 留 80pt 给 macOS Dock；Windows 任务栏一般在底部 48pt 以内，整体也合适。
+pub(crate) fn position_capsule_bottom_center<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    translation_active: bool,
+) -> tauri::Result<()> {
+    let monitor = match window.current_monitor()? {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+    let bounds = capsule_window_bounds(translation_active);
+    window.set_size(LogicalSize::new(bounds.width, bounds.height))?;
+
+    let scale = monitor.scale_factor();
+    let size = monitor.size();
+    let logical_w = size.width as f64 / scale;
+    let logical_h = size.height as f64 / scale;
+    let x = ((logical_w - bounds.width) / 2.0).max(0.0);
+    let y = (logical_h - capsule_visual_height(translation_active) - 80.0 - bounds.bottom_inset)
+        .max(0.0);
+    window.set_position(LogicalPosition::new(x, y))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CapsuleWindowBounds {
+    width: f64,
+    height: f64,
+    bottom_inset: f64,
+}
+
+fn capsule_window_bounds(translation_active: bool) -> CapsuleWindowBounds {
+    #[cfg(target_os = "windows")]
+    {
+        CapsuleWindowBounds {
+            width: 220.0,
+            height: if translation_active { 118.0 } else { 84.0 },
+            bottom_inset: 12.0,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // macOS / Linux：固定 220×110，与 1.2.11 行为一致 — 录音 / 翻译徽章
+        // 共用同一个窗口尺寸，避免按 Shift 后窗口高度变化导致胶囊整体下移。
+        let _ = translation_active;
+        CapsuleWindowBounds {
+            width: 220.0,
+            height: 110.0,
+            bottom_inset: 0.0,
+        }
+    }
+}
+
+fn capsule_visual_height(_translation_active: bool) -> f64 {
+    #[cfg(target_os = "windows")]
+    {
+        52.0
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        96.0
+    }
+}
+
+fn capsule_height_for_qa() -> f64 {
+    capsule_visual_height(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{capsule_height_for_qa, capsule_visual_height, capsule_window_bounds};
+
+    #[test]
+    fn capsule_window_bounds_leave_room_for_windows_shadow() {
+        let bounds = capsule_window_bounds(false);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            (bounds.width, bounds.height, bounds.bottom_inset),
+            (220.0, 84.0, 12.0)
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            (bounds.width, bounds.height, bounds.bottom_inset),
+            (220.0, 110.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn capsule_window_bounds_expand_for_translation_badge() {
+        let bounds = capsule_window_bounds(true);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            (bounds.width, bounds.height, bounds.bottom_inset),
+            (220.0, 118.0, 12.0)
+        );
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            (bounds.width, bounds.height, bounds.bottom_inset),
+            (220.0, 110.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn capsule_visual_height_matches_frontend_pill() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(capsule_visual_height(true), 52.0);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(capsule_visual_height(true), 96.0);
+    }
+
+    #[test]
+    fn qa_anchor_uses_normal_capsule_height_source() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(capsule_height_for_qa(), 52.0);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(capsule_height_for_qa(), 96.0);
+    }
+}

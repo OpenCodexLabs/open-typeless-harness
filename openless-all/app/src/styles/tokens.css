@@ -1,0 +1,103 @@
+/* Open Typeless Harness design tokens — ink + white + teal accent, glassy */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+  /* Palette — neutrals */
+  --ol-white: #ffffff;
+  --ol-canvas: #f7f7f8;     /* outer chrome wash */
+  --ol-surface: #ffffff;
+  --ol-surface-2: #fafafa;
+  --ol-line: rgba(0, 0, 0, 0.08);
+  --ol-line-strong: rgba(0, 0, 0, 0.14);
+  --ol-line-soft: rgba(0, 0, 0, 0.05);
+
+  /* Ink */
+  --ol-ink: #0a0a0b;
+  --ol-ink-2: #2a2a2d;
+  --ol-ink-3: rgba(10, 10, 11, 0.62);
+  --ol-ink-4: rgba(10, 10, 11, 0.42);
+  --ol-ink-5: rgba(10, 10, 11, 0.24);
+
+  /* Teal accent */
+  --ol-blue: #0f766e;
+  --ol-blue-hover: #0d5f59;
+  --ol-blue-soft: #e6fffb;
+  --ol-blue-ring: rgba(15, 118, 110, 0.22);
+
+  /* Glass */
+  --ol-glass-bg: rgba(255, 255, 255, 0.62);
+  --ol-glass-bg-strong: rgba(255, 255, 255, 0.78);
+  --ol-glass-border: rgba(255, 255, 255, 0.7);
+  --ol-glass-blur: 20px;
+  --ol-glass-blur-strong: 36px;
+
+  /* Motion */
+  --ol-motion-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --ol-motion-soft: cubic-bezier(0.22, 0.8, 0.22, 1);
+  --ol-motion-quick: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Shadows */
+  --ol-shadow-sm: 0 1px 2px rgba(15, 17, 22, 0.04), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --ol-shadow-md: 0 1px 2px rgba(15, 17, 22, 0.05), 0 6px 24px -12px rgba(15, 17, 22, 0.10), 0 0 0 0.5px rgba(0, 0, 0, 0.04);
+  --ol-shadow-lg: 0 20px 60px -20px rgba(15, 17, 22, 0.18), 0 8px 32px -16px rgba(15, 17, 22, 0.10), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  --ol-shadow-xl: 0 40px 120px -40px rgba(15, 17, 22, 0.30), 0 24px 60px -24px rgba(15, 17, 22, 0.15), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+
+  /* Radii */
+  --ol-r-sm: 6px;
+  --ol-r-md: 10px;
+  --ol-r-lg: 14px;
+  --ol-r-xl: 18px;
+  --ol-r-2xl: 22px;
+  --ol-r-pill: 999px;
+
+  /* Typography */
+  --ol-font-sans: 'Inter', 'PingFang SC', 'Microsoft YaHei', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  --ol-font-mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+
+  /* Status colors (sparse use only) */
+  --ol-ok: #16a34a;
+  --ol-ok-soft: #ecfdf5;
+  --ol-warn: #d97706;
+  --ol-warn-soft: #fff7ed;
+  --ol-err: #dc2626;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--ol-font-sans);
+  color: var(--ol-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv11', 'ss01', 'ss03';
+}
+
+/* Hide scrollbars where we want flat surfaces */
+.ol-noscrollbar::-webkit-scrollbar { display: none; }
+.ol-noscrollbar { scrollbar-width: none; }
+
+/* Thin scrollbar — 细而可见，保留"可以滚"的可见性，但不抢眼。issue #243 */
+.ol-thinscroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.ol-thinscroll::-webkit-scrollbar-track { background: transparent; }
+.ol-thinscroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.18);
+  border-radius: 3px;
+}
+.ol-thinscroll::-webkit-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.28); }
+.ol-thinscroll { scrollbar-width: thin; scrollbar-color: rgba(0, 0, 0, 0.18) transparent; }
+
+/* Glass surface */
+.ol-glass {
+  background: var(--ol-glass-bg);
+  backdrop-filter: blur(var(--ol-glass-blur)) saturate(160%);
+  -webkit-backdrop-filter: blur(var(--ol-glass-blur)) saturate(160%);
+  border: 0.5px solid var(--ol-glass-border);
+}
+
+/* Focus ring */
+.ol-ring:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ol-blue-ring);
+}
