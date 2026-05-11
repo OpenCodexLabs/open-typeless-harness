@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 1600 1000">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#fbf3e6"/>
+      <stop offset="52%" stop-color="#eefcf9"/>
+      <stop offset="100%" stop-color="#e7f0ff"/>
+    </linearGradient>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.96"/>
+      <stop offset="100%" stop-color="#f8fafc" stop-opacity="0.92"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#0f172a" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .brand { font-family: ui-rounded, "SF Pro Rounded", "Avenir Next", "Trebuchet MS", sans-serif; }
+      .mono { font-family: "SF Mono", Menlo, Consolas, monospace; }
+      .body { font-family: "Avenir Next", "SF Pro Display", system-ui, sans-serif; }
+    </style>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#bg)"/>
+  <circle cx="1330" cy="130" r="300" fill="#99f6e4" opacity="0.28"/>
+  <circle cx="230" cy="860" r="340" fill="#fed7aa" opacity="0.32"/>
+  <rect x="70" y="56" width="1460" height="888" rx="52" fill="url(#card)" filter="url(#shadow)" stroke="#ffffff" stroke-width="10"/>
+  <text x="136" y="148" class="brand" font-size="64" font-weight="800" fill="#173b71">A voice input loop that improves</text>
+  <text x="140" y="196" class="body" font-size="26" font-weight="600" fill="#0f766e">The correction after insertion becomes the memory before the next polish.</text>
+  
+    <g transform="translate(130 270)">
+      <rect x="0" y="0" width="390" height="210" rx="32" fill="#ecfeff" stroke="#0f766e" stroke-width="4"/>
+      <text x="44" y="72" class="body" font-size="34" font-weight="800" fill="#134e4a">1. Speak</text>
+      <text x="44" y="128" class="body" font-size="24" fill="#0f172a">type script 泛型</text>
+      <text x="44" y="166" class="body" font-size="20" fill="#64748b">Natural voice input</text>
+      
+    <path d="M 390 105 C 455 105, 455 105, 520 105" fill="none" stroke="#0f766e" stroke-width="8" stroke-linecap="round"/>
+    <path d="M 498 89 L 520 105 L 498 121" fill="none" stroke="#0f766e" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  
+    </g>
+    <g transform="translate(650 270)">
+      <rect x="0" y="0" width="390" height="210" rx="32" fill="#eff6ff" stroke="#2563eb" stroke-width="4"/>
+      <text x="44" y="72" class="body" font-size="34" font-weight="800" fill="#1e3a8a">2. Polish</text>
+      <text x="44" y="128" class="body" font-size="24" fill="#0f172a">TypeScript 泛型</text>
+      <text x="44" y="166" class="body" font-size="20" fill="#64748b">LLM + retrieved skills</text>
+      
+    <path d="M 390 105 C 455 105, 455 105, 520 105" fill="none" stroke="#0f766e" stroke-width="8" stroke-linecap="round"/>
+    <path d="M 498 89 L 520 105 L 498 121" fill="none" stroke="#0f766e" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  
+    </g>
+    <g transform="translate(1170 270)">
+      <rect x="0" y="0" width="300" height="210" rx="32" fill="#fff7ed" stroke="#f59e0b" stroke-width="4"/>
+      <text x="44" y="72" class="body" font-size="34" font-weight="800" fill="#92400e">3. Edit</text>
+      <text x="44" y="128" class="body" font-size="24" fill="#0f172a">知呼 -> 知乎</text>
+      <text x="44" y="166" class="body" font-size="20" fill="#64748b">User correction</text>
+    </g>
+    <g transform="translate(260 600)">
+      <rect x="0" y="0" width="1080" height="150" rx="36" fill="#0f172a"/>
+      <text x="54" y="62" class="body" font-size="30" font-weight="800" fill="#f8fafc">Local speech skill memory</text>
+      <text x="54" y="108" class="mono" font-size="28" fill="#99f6e4">type script -> TypeScript     |     知呼 -> 知乎</text>
+    </g>
+    
+    <path d="M 1260 480 C 1260 480, 1260 600, 1260 600" fill="none" stroke="#f59e0b" stroke-width="8" stroke-linecap="round"/>
+    <path d="M 1238 584 L 1260 600 L 1238 616" fill="none" stroke="#f59e0b" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  
+    
+    <path d="M 260 675 C 225 675, 225 380, 190 380" fill="none" stroke="#0f766e" stroke-width="8" stroke-linecap="round"/>
+    <path d="M 168 364 L 190 380 L 168 396" fill="none" stroke="#0f766e" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  
+  
+</svg>

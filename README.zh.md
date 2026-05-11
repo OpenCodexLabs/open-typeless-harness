@@ -43,10 +43,16 @@ Open Typeless Harness 只围绕一个判断：
 ## 产品预览
 
 <p align="center">
-  <img src="docs/assets/open-typeless-harness-cover.png" alt="Open Typeless Harness product concept" width="780">
+  <img src="docs/assets/open-typeless-harness-product.png" alt="Open Typeless Harness product preview" width="780">
 </p>
 
-> 产品截图和演示视频下一步补。当前 preview 聚焦核心学习闭环：语音输入、润色插入、改动监控、本地 speech-skill memory。
+<p align="center">
+  <img src="docs/assets/open-typeless-harness-demo.gif" alt="Open Typeless Harness demo" width="780">
+</p>
+
+<p align="center">
+  <a href="docs/assets/open-typeless-harness-demo.mp4">下载 MP4 演示视频</a>
+</p>
 
 ## 解决什么
 
@@ -56,6 +62,10 @@ Open Typeless Harness 只围绕一个判断：
 - 你在任意输入框口述，它应该融入你正在使用的 app。
 
 ## 工作原理
+
+<p align="center">
+  <img src="docs/assets/open-typeless-harness-learning-loop.png" alt="Open Typeless Harness learning loop" width="780">
+</p>
 
 ```text
 Voice input

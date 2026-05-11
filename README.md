@@ -43,10 +43,16 @@ The result is a voice input layer that should become more aligned with your voca
 ## Product Preview
 
 <p align="center">
-  <img src="docs/assets/open-typeless-harness-cover.png" alt="Open Typeless Harness product concept" width="780">
+  <img src="docs/assets/open-typeless-harness-product.png" alt="Open Typeless Harness product preview" width="780">
 </p>
 
-> Product screenshots and demo video are coming next. The current preview focuses on the core learning loop: voice input, polished insertion, edit monitoring, and local speech-skill memory.
+<p align="center">
+  <img src="docs/assets/open-typeless-harness-demo.gif" alt="Open Typeless Harness demo" width="780">
+</p>
+
+<p align="center">
+  <a href="docs/assets/open-typeless-harness-demo.mp4">Download MP4 demo</a>
+</p>
 
 ## What It Solves
 
@@ -56,6 +62,10 @@ The result is a voice input layer that should become more aligned with your voca
 - You dictate into any focused field; it should fit into the app you are already using.
 
 ## How It Works
+
+<p align="center">
+  <img src="docs/assets/open-typeless-harness-learning-loop.png" alt="Open Typeless Harness learning loop" width="780">
+</p>
 
 ```text
 Voice input
